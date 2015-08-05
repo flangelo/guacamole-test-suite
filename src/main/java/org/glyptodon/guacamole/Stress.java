@@ -23,6 +23,8 @@
 
 package org.glyptodon.guacamole;
 
+import java.util.Timer;
+import java.util.TimerTask;
 import org.glyptodon.guacamole.io.GuacamoleReader;
 import org.glyptodon.guacamole.io.GuacamoleWriter;
 import org.glyptodon.guacamole.net.GuacamoleSocket;
@@ -46,6 +48,16 @@ public class Stress {
      * Logger for this class.
      */
     private static final Logger logger = LoggerFactory.getLogger(Stress.class);
+
+    /**
+     * Object holding simple metrics.
+     */
+    private static Metrics metrics;
+
+    /**
+     * Timer which kicks in every second to collect and log metrics.
+     */
+    private static Timer metricLoggerThread;
 
     /**
      * Given a command-line argument of the form "--name=value", returns the
@@ -175,6 +187,14 @@ public class Stress {
             logger.info("Connected.");
             long connection_start = System.currentTimeMillis();
 
+            // Start metrics logger
+            metrics = new Metrics(connection_start);
+            int collectionFrequency = 1000;
+            metricLoggerThread = new Timer("metricsLogger");
+            metricLoggerThread.scheduleAtFixedRate(
+                    new MetricsLoggerTask(metrics),
+                    collectionFrequency, collectionFrequency);
+
             // Get I/O objects
             GuacamoleWriter writer = socket.getWriter();
             GuacamoleReader reader = socket.getReader();
@@ -186,7 +206,7 @@ public class Stress {
             }
             
             // Frame statistics
-            long frame_start = System.currentTimeMillis();
+            long frameStart = System.currentTimeMillis();
             int bytes = 0;
 
             // Read all instructions
@@ -206,16 +226,19 @@ public class Stress {
                 if (instruction.getOpcode().equals("sync")) {
 
                     // Note frame
-                    if (bytes != 0)
+                    if (bytes != 0) {
+                        long frameDuration = current - frameStart;
                         logger.info("Frame duration={}ms, {} bytes",
-                                current-frame_start, bytes);
+                                    frameDuration, bytes);
+                        metrics.addValue("frame", 1);
+                    }
 
                     // Respond to sync (unless something else will be writing)
                     if (!hammer)
                         writer.writeInstruction(instruction);
 
                     // Next frame
-                    frame_start = current;
+                    frameStart = current;
                     bytes = 0;
 
                 }
@@ -227,14 +250,25 @@ public class Stress {
 
                 // Otherwise, add total bytes
                 else {
-                    for (String arg : instruction.getArgs())
-                        bytes += arg.length();
+                    for (String arg : instruction.getArgs()) {
+                        int currentBytes = arg.length();
+                        metrics.addValue("bytes", currentBytes);
+                        bytes += currentBytes;
+                    }
+
+                    // Add image updates to metrics counter
+                    if (instruction.getOpcode().equals("png") ||
+                        instruction.getOpcode().equals("jpeg")) {
+                        metrics.addValue(instruction.getOpcode(), 1);
+                    }
                 }
 
             } // end for each instruction
 
             logger.error("End of input stream.");
             
+            metrics.logTotals(System.currentTimeMillis());
+
         }
         catch (GuacamoleException e) {
             logger.error("Error reading instruction stream.", e);
@@ -243,6 +277,37 @@ public class Stress {
         logger.info("Disconnected.");
         System.exit(1);
 
+    }
+    
+    /**
+     * Internal task which logs and resets metrics on a scheduled basis.
+     */
+    static class MetricsLoggerTask extends TimerTask {
+
+        /**
+         * Object holding metrics
+         */
+        private final Metrics metrics;
+
+        /**
+         * Constructor.
+         *
+         * @param metrics
+         *     The metrics object to execute.
+         */
+        public MetricsLoggerTask(Metrics metrics) {
+            this.metrics = metrics;
+        }
+
+        /**
+         * Start a new cycle.
+         * Logs the metrics stats and resets the counter.
+         */
+        @Override
+        public void run() {
+            metrics.log();
+            metrics.reset();
+        }
     }
 
 }
